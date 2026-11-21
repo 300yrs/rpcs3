@@ -6,6 +6,8 @@
 #include "util/types.hpp"
 #include "Crypto/aes.h"
 
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 
@@ -148,6 +150,18 @@ protected:
 	iso_fs_metadata m_meta;
 	bool m_raw_device = false;
 	u64 m_pos = 0;
+
+	// Raw device only: a window of whole sectors fetched in a single physical read. The small reads a file system
+	// walk is made of (a length byte, a record header, a name) mostly land on the same few sectors, and without this
+	// window each of them costs a round trip to the drive
+	std::unique_ptr<u8[]> m_raw_cache;
+	u64 m_raw_cache_addr = 0;
+	u64 m_raw_cache_size = 0;
+	std::mutex m_raw_cache_mutex;
+
+	// Copies the sector starting at "lba_address" (a multiple of ISO_SECTOR_SIZE) into "out" (ISO_SECTOR_SIZE bytes),
+	// from the window when it holds it, otherwise by refilling the window from the drive
+	bool read_raw_sector(u64 lba_address, u8* out);
 
 	std::pair<u64, iso_extent_info> get_extent_pos(u64 pos) const;
 	u64 local_extent_remaining(u64 pos) const;

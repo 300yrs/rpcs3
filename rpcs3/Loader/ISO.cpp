@@ -30,6 +30,11 @@ struct iso_sector
 // How much of a raw device is read per request: one ISO_SECTOR_SIZE at a time costs a command, and often a seek, per sector
 constexpr u64 ISO_RAW_READ_SIZE = ISO_SECTOR_SIZE * 512; // 1 MB
 
+// How much of a raw device a single small read pulls into the per-file window. Large enough to cover a directory
+// extent (or a good part of it) in one request, small enough to cost next to nothing in transfer time
+constexpr u64 ISO_RAW_CACHE_SIZE = ISO_SECTOR_SIZE * 16; // 32 KB
+static_assert(ISO_RAW_CACHE_SIZE <= ISO_RAW_READ_SIZE);
+
 static void* get_aligned_buf()
 {
 	static thread_local struct aligned_buf
@@ -1348,11 +1353,15 @@ iso_archive::iso_archive(const std::string& path)
 	//       beginning here
 	fs::file iso_file(std::move(file));
 
+	const auto parse_start = std::chrono::steady_clock::now();
+
 	if (!iso_parse_file_system(iso_file, m_root, path))
 	{
 		invalidate();
 		return;
 	}
+
+	const auto parse_end = std::chrono::steady_clock::now();
 
 	// Only when the archive object is fully set, we can finally initialize the decryption object needing the archive object
 	m_dec = std::make_shared<iso_file_decryption>();
@@ -1363,6 +1372,12 @@ iso_archive::iso_archive(const std::string& path)
 		invalidate();
 		return;
 	}
+
+	const auto init_end = std::chrono::steady_clock::now();
+
+	iso_log.notice("iso_archive: Opened '%s' (file system: %u ms, decryption setup: %u ms)", path,
+		std::chrono::duration_cast<std::chrono::milliseconds>(parse_end - parse_start).count(),
+		std::chrono::duration_cast<std::chrono::milliseconds>(init_end - parse_end).count());
 }
 
 bool iso_archive::set_disc_key(const std::array<u8, 16>& disc_key)
@@ -1620,6 +1635,51 @@ u64 iso_file::file_offset(u64 pos) const
 	return (extent.start * ISO_SECTOR_SIZE) + local_pos;
 }
 
+bool iso_file::read_raw_sector(u64 lba_address, u8* out)
+{
+	std::lock_guard lock(m_raw_cache_mutex);
+
+	if (m_raw_cache && lba_address >= m_raw_cache_addr && lba_address - m_raw_cache_addr < m_raw_cache_size)
+	{
+		std::memcpy(out, &m_raw_cache[lba_address - m_raw_cache_addr], ISO_SECTOR_SIZE);
+		return true;
+	}
+
+	void* aligned_buf = get_aligned_buf(); // thread-safe buffer
+
+	// Never ask for anything past the end of the medium: the window shrinks to what is left of it
+	const u64 medium_size = m_file.size();
+	const u64 remaining = lba_address < medium_size ? (medium_size - lba_address) / ISO_SECTOR_SIZE * ISO_SECTOR_SIZE : 0;
+	const u64 window = std::clamp<u64>(remaining, ISO_SECTOR_SIZE, ISO_RAW_CACHE_SIZE);
+
+	u64 read = m_file.read_at(lba_address, aligned_buf, window);
+
+	// A wider request may trip on an unreadable sector the caller never asked for: fall back to the single sector,
+	// which is exactly what was read before the window existed
+	if (read < ISO_SECTOR_SIZE && window > ISO_SECTOR_SIZE)
+	{
+		read = m_file.read_at(lba_address, aligned_buf, ISO_SECTOR_SIZE);
+	}
+
+	if (read < ISO_SECTOR_SIZE)
+	{
+		return false;
+	}
+
+	if (!m_raw_cache)
+	{
+		m_raw_cache = std::make_unique<u8[]>(ISO_RAW_CACHE_SIZE);
+	}
+
+	m_raw_cache_addr = lba_address;
+	m_raw_cache_size = read / ISO_SECTOR_SIZE * ISO_SECTOR_SIZE;
+
+	std::memcpy(m_raw_cache.get(), aligned_buf, m_raw_cache_size);
+	std::memcpy(out, aligned_buf, ISO_SECTOR_SIZE);
+
+	return true;
+}
+
 u64 iso_file::read(void* buffer, u64 size)
 {
 	const auto r = read_at(m_pos, buffer, size);
@@ -1700,9 +1760,11 @@ u64 iso_file::read_at(u64 offset, void* buffer, u64 size)
 	// First sector
 	//
 
-	u64 total_read = m_file.read_at(first_sec.lba_address, aligned_buf, ISO_SECTOR_SIZE);
+	std::array<u8, ISO_SECTOR_SIZE> sector_buf;
 
-	std::memcpy(buffer, &reinterpret_cast<u8*>(aligned_buf)[first_sec.offset], first_sec.size);
+	u64 total_read = read_raw_sector(first_sec.lba_address, sector_buf.data()) ? ISO_SECTOR_SIZE : 0;
+
+	std::memcpy(buffer, &sector_buf[first_sec.offset], first_sec.size);
 
 	const u64 sector_count = (last_sec.lba_address - first_sec.lba_address) / ISO_SECTOR_SIZE + 1;
 
@@ -1750,9 +1812,9 @@ u64 iso_file::read_at(u64 offset, void* buffer, u64 size)
 	// Last sector
 	//
 
-	total_read += m_file.read_at(last_sec.address_aligned, aligned_buf, ISO_SECTOR_SIZE);
+	total_read += read_raw_sector(last_sec.address_aligned, sector_buf.data()) ? ISO_SECTOR_SIZE : 0;
 
-	std::memcpy(&reinterpret_cast<u8*>(buffer)[max_size - last_sec.size], aligned_buf, last_sec.size);
+	std::memcpy(&reinterpret_cast<u8*>(buffer)[max_size - last_sec.size], sector_buf.data(), last_sec.size);
 
 	//
 	// As last, check for an unlikely reading error
