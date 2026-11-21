@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string_view>
 
 bool is_iso_file(const std::string& path, u64* size = nullptr, bool* is_raw_device = nullptr);
 
@@ -163,6 +164,9 @@ protected:
 	// from the window when it holds it, otherwise by refilling the window from the drive
 	bool read_raw_sector(u64 lba_address, u8* out);
 
+	// Every read of the underlying image goes through here, so reads from a raw device can be counted and timed
+	u64 raw_read_at(u64 address, void* buffer, u64 size);
+
 	std::pair<u64, iso_extent_info> get_extent_pos(u64 pos) const;
 	u64 local_extent_remaining(u64 pos) const;
 	u64 local_extent_size(u64 pos) const;
@@ -283,3 +287,7 @@ public:
 	std::unique_ptr<fs::file_base> open(const std::string& path, bs_t<fs::open_mode> mode) override;
 	std::unique_ptr<fs::dir_base> open_dir(const std::string& path) override;
 };
+
+// Logs how many reads have gone to raw devices (optical drives) since startup, how much they returned and how long
+// they took in total, tagged with "when"
+void iso_log_raw_read_stats(std::string_view when);

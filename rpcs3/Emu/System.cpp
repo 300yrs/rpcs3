@@ -2554,7 +2554,11 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 		{
 			// Decrypt SELF
 			had_been_decrypted = true;
+			iso_log_raw_read_stats("before decrypting the executable");
+			const auto decrypt_start = std::chrono::steady_clock::now();
 			elf_file = decrypt_self(elf_file, klic.empty() ? nullptr : reinterpret_cast<u8*>(&klic[0]), &g_ps3_process_info.self_info);
+			sys_log.notice("Decrypted the executable in %u ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - decrypt_start).count());
+			iso_log_raw_read_stats("after decrypting the executable");
 		}
 		else
 		{
@@ -2736,7 +2740,12 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 
 			const auto _main = ensure(g_fxo->init<main_ppu_module<lv2_obj>>());
 
-			if (ppu_load_exec(ppu_exec, false, m_path, DeserialManager()))
+			const auto load_start = std::chrono::steady_clock::now();
+			const bool exec_loaded = ppu_load_exec(ppu_exec, false, m_path, DeserialManager());
+			sys_log.notice("ppu_load_exec() took %u ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - load_start).count());
+			iso_log_raw_read_stats("after loading the executable");
+
+			if (exec_loaded)
 			{
 				if (g_cfg.core.ppu_debug && had_been_decrypted)
 				{
