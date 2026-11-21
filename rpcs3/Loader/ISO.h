@@ -4,6 +4,7 @@
 
 #include "Utilities/File.h"
 #include "util/types.hpp"
+#include "util/atomic.hpp"
 #include "Crypto/aes.h"
 
 #include <memory>
@@ -160,9 +161,15 @@ protected:
 	u64 m_raw_cache_size = 0;
 	std::mutex m_raw_cache_mutex;
 
-	// Copies the sector starting at "lba_address" (a multiple of ISO_SECTOR_SIZE) into "out" (ISO_SECTOR_SIZE bytes),
-	// from the window when it holds it, otherwise by refilling the window from the drive
-	bool read_raw_sector(u64 lba_address, u8* out);
+	// Where the next read starts if the caller reads the file front to back: a read starting there gets a large
+	// read-ahead instead of the small window
+	atomic_t<u64> m_raw_next_offset = umax;
+
+	// Copies "size" bytes of whole sectors starting at "lba_address" (both multiples of ISO_SECTOR_SIZE) into "out",
+	// from the window when it holds them, otherwise by refilling the window from the drive (by a large amount when
+	// "readahead" is set). Requests of ISO_RAW_READ_SIZE and more bypass the window. Returns the bytes copied
+	u64 read_raw_sectors(u64 lba_address, u64 size, u8* out, bool readahead);
+	bool read_raw_sector(u64 lba_address, u8* out, bool readahead = false);
 
 	// Every read of the underlying image goes through here, so reads from a raw device can be counted and timed
 	u64 raw_read_at(u64 address, void* buffer, u64 size);
