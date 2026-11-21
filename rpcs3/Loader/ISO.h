@@ -4,10 +4,14 @@
 
 #include "Utilities/File.h"
 #include "util/types.hpp"
+#include "util/atomic.hpp"
 #include "Crypto/aes.h"
 
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
+#include <string_view>
 
 bool is_iso_file(const std::string& path, u64* size = nullptr, bool* is_raw_device = nullptr);
 
@@ -149,6 +153,27 @@ protected:
 	bool m_raw_device = false;
 	u64 m_pos = 0;
 
+	// Raw device only: a window of whole sectors fetched in a single physical read. The small reads a file system
+	// walk is made of (a length byte, a record header, a name) mostly land on the same few sectors, and without this
+	// window each of them costs a round trip to the drive
+	std::unique_ptr<u8[]> m_raw_cache;
+	u64 m_raw_cache_addr = 0;
+	u64 m_raw_cache_size = 0;
+	std::mutex m_raw_cache_mutex;
+
+	// Where the next read starts if the caller reads the file front to back: a read starting there gets a large
+	// read-ahead instead of the small window
+	atomic_t<u64> m_raw_next_offset = umax;
+
+	// Copies "size" bytes of whole sectors starting at "lba_address" (both multiples of ISO_SECTOR_SIZE) into "out",
+	// from the window when it holds them, otherwise by refilling the window from the drive (by a large amount when
+	// "readahead" is set). Requests of ISO_RAW_READ_SIZE and more bypass the window. Returns the bytes copied
+	u64 read_raw_sectors(u64 lba_address, u64 size, u8* out, bool readahead);
+	bool read_raw_sector(u64 lba_address, u8* out, bool readahead = false);
+
+	// Every read of the underlying image goes through here, so reads from a raw device can be counted and timed
+	u64 raw_read_at(u64 address, void* buffer, u64 size);
+
 	std::pair<u64, iso_extent_info> get_extent_pos(u64 pos) const;
 	u64 local_extent_remaining(u64 pos) const;
 	u64 local_extent_size(u64 pos) const;
@@ -269,3 +294,7 @@ public:
 	std::unique_ptr<fs::file_base> open(const std::string& path, bs_t<fs::open_mode> mode) override;
 	std::unique_ptr<fs::dir_base> open_dir(const std::string& path) override;
 };
+
+// Logs how many reads have gone to raw devices (optical drives) since startup, how much they returned and how long
+// they took in total, tagged with "when"
+void iso_log_raw_read_stats(std::string_view when);
